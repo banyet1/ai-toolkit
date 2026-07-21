@@ -21,6 +21,7 @@ from toolkit.buckets import get_bucket_for_image_size, BucketResolution
 from toolkit.config_modules import DatasetConfig, preprocess_dataset_raw_config
 from toolkit.dataloader_mixins import CaptionMixin, BucketsMixin, LatentCachingMixin, Augments, CLIPCachingMixin, ControlCachingMixin, TextEmbeddingCachingMixin
 from toolkit.data_transfer_object.data_loader import FileItemDTO, DataLoaderBatchDTO
+from toolkit.metadata import load_metadata_from_safetensors
 from toolkit.print import print_acc
 from toolkit.accelerator import get_accelerator
 
@@ -39,6 +40,143 @@ if TYPE_CHECKING:
 image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
 video_extensions = ['.mp4', '.avi', '.mov', '.webm', '.mkv', '.wmv', '.m4v', '.flv']
 audio_extensions = ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a']
+
+latent_cache_required_metadata = (
+    'filename',
+    'scale_to_width',
+    'scale_to_height',
+    'crop_x',
+    'crop_y',
+    'crop_width',
+    'crop_height',
+    'latent_space_version',
+    'latent_version',
+)
+
+
+def _latent_metadata_matches_dataset(
+        metadata, dataset_config, latent_space_version, is_audio_model=False, sample_rate=48000):
+    if any(key not in metadata for key in latent_cache_required_metadata):
+        return False
+
+    if metadata['latent_space_version'] != latent_space_version or metadata['latent_version'] != 1:
+        return False
+
+    cached_is_audio = bool(metadata.get('is_audio_model', False))
+    if cached_is_audio != is_audio_model:
+        return False
+    if cached_is_audio and int(metadata.get('sample_rate', 48000)) != int(sample_rate):
+        return False
+
+    cached_auto_frame_count = bool(metadata.get('auto_frame_count', False))
+    cached_num_frames = metadata.get('num_frames', 1)
+    current_is_video = dataset_config.auto_frame_count or dataset_config.num_frames > 1
+    cached_is_video = cached_auto_frame_count or cached_num_frames > 1
+    if cached_is_video != current_is_video:
+        return False
+    if current_is_video:
+        if cached_auto_frame_count != dataset_config.auto_frame_count:
+            return False
+        if not dataset_config.auto_frame_count and int(cached_num_frames) != int(dataset_config.num_frames):
+            return False
+        if int(metadata.get('fps', 24)) != int(dataset_config.fps):
+            return False
+        if bool(metadata.get('do_i2v', False)) != bool(dataset_config.do_i2v):
+            return False
+        if bool(metadata.get('do_audio', False)) != bool(dataset_config.do_audio):
+            return False
+        if dataset_config.do_audio:
+            if bool(metadata.get('audio_normalize', False)) != bool(dataset_config.audio_normalize):
+                return False
+            if bool(metadata.get('audio_preserve_pitch', False)) != bool(dataset_config.audio_preserve_pitch):
+                return False
+
+    try:
+        scale_to_width = int(metadata['scale_to_width'])
+        scale_to_height = int(metadata['scale_to_height'])
+        crop_x = int(metadata['crop_x'])
+        crop_y = int(metadata['crop_y'])
+        crop_width = int(metadata['crop_width'])
+        crop_height = int(metadata['crop_height'])
+    except (TypeError, ValueError):
+        return False
+
+    if min(scale_to_width, scale_to_height, crop_width, crop_height) <= 0:
+        return False
+    if crop_x < 0 or crop_y < 0:
+        return False
+    if crop_x + crop_width > scale_to_width or crop_y + crop_height > scale_to_height:
+        return False
+
+    if dataset_config.buckets:
+        if dataset_config.square_crop:
+            if crop_width != dataset_config.resolution or crop_height != dataset_config.resolution:
+                return False
+        elif not is_audio_model:
+            # The cache metadata does not retain the original source dimensions, so the
+            # exact bucket cannot be reconstructed safely. A cached bucket can never exceed
+            # the configured pixel budget, though, and its dimensions must use the model's
+            # required divisibility.
+            if crop_width * crop_height > dataset_config.resolution ** 2:
+                return False
+            if crop_width % dataset_config.bucket_tolerance or crop_height % dataset_config.bucket_tolerance:
+                return False
+
+    if bool(metadata.get('flip_x', False)) and not dataset_config.flip_x:
+        return False
+    if bool(metadata.get('flip_y', False)) and not dataset_config.flip_y:
+        return False
+
+    return True
+
+
+def discover_latent_only_entries(
+        dataset_folder, dataset_config, latent_space_version, is_audio_model=False, sample_rate=48000):
+    """Find usable disk-cached latents whose source image/video/audio is absent."""
+    if not os.path.isdir(dataset_folder) or dataset_config.load_image_when_caching_latents:
+        return []
+
+    candidates = {}
+    for root, _, files in os.walk(dataset_folder):
+        if os.path.basename(root) != '_latent_cache':
+            continue
+        for filename in files:
+            if not filename.lower().endswith('.safetensors'):
+                continue
+            latent_path = os.path.join(root, filename)
+            metadata = load_metadata_from_safetensors(latent_path)
+            if not _latent_metadata_matches_dataset(
+                    metadata,
+                    dataset_config,
+                    latent_space_version,
+                    is_audio_model=is_audio_model,
+                    sample_rate=sample_rate,
+            ):
+                continue
+
+            source_filename = metadata['filename']
+            if os.path.basename(source_filename) != source_filename:
+                continue
+            source_path = os.path.join(os.path.dirname(root), source_filename)
+            if os.path.exists(source_path):
+                continue
+
+            variant_key = (
+                os.path.normcase(os.path.abspath(source_path)),
+                bool(metadata.get('flip_x', False)),
+                bool(metadata.get('flip_y', False)),
+            )
+            entry = {
+                'path': source_path,
+                'latent_cache_path': latent_path,
+                'latent_metadata': metadata,
+            }
+            # Stale caches can coexist. Use the newest compatible cache for each source/flip variant.
+            current = candidates.get(variant_key)
+            if current is None or os.path.getmtime(latent_path) > os.path.getmtime(current['latent_cache_path']):
+                candidates[variant_key] = entry
+
+    return list(candidates.values())
 
 
 class RescaleTransform:
@@ -444,10 +582,6 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         # remove items in the _controls_ folder
         file_list = [x for x in file_list if not os.path.basename(os.path.dirname(x)) == "_controls"]
 
-        if self.dataset_config.num_repeats > 1:
-            # repeat the list
-            file_list = file_list * self.dataset_config.num_repeats
-
         if self.dataset_config.standardize_images:
             if self.sd.is_xl or self.sd.is_vega or self.sd.is_ssd:
                 NormalizeMethod = NormalizeSDXLTransform
@@ -520,10 +654,51 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                 temporal_compression = self.sd.vae.config.scale_factor_temporal
             if hasattr(self.sd.unet, 'config') and hasattr(self.sd.unet.config, 'temporal_compression_ratio'):
                 temporal_compression = self.sd.unet.config.temporal_compression_ratio
+
+        file_entries = [{'path': path} for path in file_list]
+        latent_only_entries = []
+        if self.is_caching_latents:
+            latent_only_entries = discover_latent_only_entries(
+                dataset_folder,
+                dataset_config,
+                latent_space_version,
+                is_audio_model=self.is_audio_model,
+                sample_rate=self.sd.sample_rate if self.is_audio_model and self.sd is not None else 48000,
+            )
+            latent_source_paths = {
+                os.path.normcase(os.path.abspath(entry['path'])) for entry in latent_only_entries
+            }
+            # A JSON dataset can still list a source that has since been removed. Its cached
+            # latent entry replaces that missing source rather than creating a failed duplicate.
+            file_entries = [
+                entry for entry in file_entries
+                if os.path.exists(entry['path'])
+                or os.path.normcase(os.path.abspath(entry['path'])) not in latent_source_paths
+            ]
+            file_entries.extend(latent_only_entries)
+
+        if self.dataset_config.num_repeats > 1:
+            file_entries = file_entries * self.dataset_config.num_repeats
         
         bad_count = 0
-        for file in tqdm(file_list):
+        for file_entry in tqdm(file_entries):
+            file = file_entry['path']
             try:
+                latent_metadata = file_entry.get('latent_metadata', {})
+                latent_file_kwargs = {}
+                if latent_metadata:
+                    latent_file_kwargs = {
+                        'latent_cache_path': file_entry['latent_cache_path'],
+                        'latent_metadata': latent_metadata,
+                        'scale_to_width': latent_metadata['scale_to_width'],
+                        'scale_to_height': latent_metadata['scale_to_height'],
+                        'crop_x': latent_metadata['crop_x'],
+                        'crop_y': latent_metadata['crop_y'],
+                        'crop_width': latent_metadata['crop_width'],
+                        'crop_height': latent_metadata['crop_height'],
+                        'flip_x': latent_metadata.get('flip_x', False),
+                        'flip_y': latent_metadata.get('flip_y', False),
+                    }
                 file_item = FileItemDTO(
                     sd=self.sd,
                     path=file,
@@ -538,6 +713,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                     latent_space_version=latent_space_version,
                     temporal_compression=temporal_compression,
                     sample_rate=self.sd.sample_rate if self.is_audio_model and self.sd is not None else 48000,
+                    **latent_file_kwargs,
                 )
                 self.file_list.append(file_item)
             except Exception as e:
@@ -559,11 +735,13 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         else:
             print_acc(f"  -  Found {len(self.file_list)} images")
             assert len(self.file_list) > 0, f"no images found in {self.dataset_path}"
+        if len(latent_only_entries) > 0:
+            print_acc(f"  -  Using {len(latent_only_entries)} cached latents without source files")
 
         # handle x axis flips
         if self.dataset_config.flip_x:
             print_acc("  -  adding x axis flips")
-            current_file_list = [x for x in self.file_list]
+            current_file_list = [x for x in self.file_list if not x.is_latent_only]
             for file_item in current_file_list:
                 # create a copy that is flipped on the x axis
                 new_file_item = copy.deepcopy(file_item)
@@ -573,7 +751,7 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
         # handle y axis flips
         if self.dataset_config.flip_y:
             print_acc("  -  adding y axis flips")
-            current_file_list = [x for x in self.file_list]
+            current_file_list = [x for x in self.file_list if not x.is_latent_only]
             for file_item in current_file_list:
                 # create a copy that is flipped on the y axis
                 new_file_item = copy.deepcopy(file_item)

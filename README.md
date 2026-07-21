@@ -244,6 +244,11 @@ replaced.
 Images are never upscaled but they are downscaled and placed in buckets for batching. **You do not need to crop/resize your images**.
 The loader will automatically resize them and can handle varying aspect ratios. 
 
+When `cache_latents` or `cache_latents_to_disk` is enabled, valid files already stored under `_latent_cache` can be
+used even if their original image, video, or audio files are no longer present. Keep the matching caption files next
+to `_latent_cache` (for example, keep `image2.txt` after removing `image2.jpg`). Set
+`load_image_when_caching_latents: false`, which is the default, for latent-only loading.
+
 
 ## Training Specific Layers
 

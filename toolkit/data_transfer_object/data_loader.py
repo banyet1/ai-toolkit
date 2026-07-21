@@ -60,6 +60,9 @@ class FileItemDTO(
         self.sample_rate = kwargs.get("sample_rate", 48000)
         self.num_frames = self.dataset_config.num_frames
         self.temporal_compression = kwargs.get("temporal_compression", 8)
+        latent_cache_path = kwargs.get("latent_cache_path", None)
+        latent_metadata = kwargs.get("latent_metadata", {})
+        self.is_latent_only = latent_cache_path is not None
         size_database = kwargs.get("size_database", {})
         dataset_root = kwargs.get("dataset_root", None)
         self.encode_control_in_text_embeddings = kwargs.get(
@@ -74,9 +77,11 @@ class FileItemDTO(
         else:
             file_key = os.path.basename(self.path)
 
-        file_signature = get_quick_signature_string(self.path)
-        if file_signature is None:
-            raise Exception("Error: Could not get file signature for {self.path}")
+        file_signature = None
+        if not self.is_latent_only:
+            file_signature = get_quick_signature_string(self.path)
+            if file_signature is None:
+                raise Exception(f"Error: Could not get file signature for {self.path}")
 
         use_db_entry = False
         if file_key in size_database:
@@ -87,7 +92,11 @@ class FileItemDTO(
                 and db_entry[2] == file_signature
             ):
                 use_db_entry = True
-        if self.is_audio_model:
+        if self.is_latent_only:
+            scale = self.dataset_config.scale if self.dataset_config.scale else 1.0
+            w = max(1, round(int(latent_metadata['scale_to_width']) / scale))
+            h = max(1, round(int(latent_metadata['scale_to_height']) / scale))
+        elif self.is_audio_model:
             # get the length of the audio file in ms
             with av.open(self.path) as c:
                 if c.duration is not None:
@@ -151,6 +160,11 @@ class FileItemDTO(
         self.crop_height: int = kwargs.get("crop_height", self.scale_to_height)
         self.flip_x: bool = kwargs.get("flip_x", False)
         self.flip_y: bool = kwargs.get("flip_x", False)
+        if self.is_latent_only:
+            self.flip_x = bool(latent_metadata.get("flip_x", False))
+            self.flip_y = bool(latent_metadata.get("flip_y", False))
+            self._latent_path = latent_cache_path
+            self.is_latent_cached = True
         self.augments: List[str] = self.dataset_config.augments
         self.loss_multiplier: float = self.dataset_config.loss_multiplier
 

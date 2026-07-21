@@ -230,6 +230,17 @@ class BucketsMixin:
         # for file_item in enumerate(file_list):
         for idx, file_item in enumerate(file_list):
             file_item: 'FileItemDTO' = file_item
+            if file_item.is_latent_only:
+                if self.is_audio_model:
+                    bucket_key = f"{file_item.width}ms"
+                    if bucket_key not in self.buckets:
+                        self.buckets[bucket_key] = Bucket(file_item.width, 1)
+                else:
+                    bucket_key = f'{file_item.crop_width}x{file_item.crop_height}'
+                    if bucket_key not in self.buckets:
+                        self.buckets[bucket_key] = Bucket(file_item.crop_width, file_item.crop_height)
+                self.buckets[bucket_key].file_list_idx.append(idx)
+                continue
             if self.is_audio_model:
                 bucket_key = f"{file_item.width}ms"
                 if bucket_key not in self.buckets:
@@ -1667,6 +1678,8 @@ class LatentCachingFileItemDTOMixin:
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
+        if self.is_latent_only and self._latent_path is not None:
+            return self._latent_path
         if self._latent_path is not None and not recalculate:
             return self._latent_path
         else:
